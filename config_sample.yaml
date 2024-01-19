@@ -1,0 +1,24 @@
+#name: testaaaa
+plugins:
+  dockercheck:
+    interval: 60
+    sockPath: /var/run/docker.sock
+  processcheck:
+    interval: 60
+    processes:
+      - kubelet
+      - dockerd
+      - dhclient
+  customizationcheck:
+    interval: 60
+    customizitions:
+      - name: test
+        fileConfirmations:
+          - name: 配置文件
+            path: /etc/docker/daemon.json
+            content:
+              - data-root
+              - data/bcs/service
+            expectedexist: true
+            expectedcontentmatched: true
+
