@@ -41,7 +41,7 @@ func SetMetric(metricVec *prometheus.GaugeVec, gaugeVecSetList []*GaugeVecSet) {
 	metricVec.Reset()
 
 	for _, gaugeVecSet := range gaugeVecSetList {
-		metricVec.WithLabelValues(gaugeVecSet.Labels...).Set(gaugeVecSet.Value)
+		metricVec.WithLabelValues(gaugeVecSet.Labels...).Add(gaugeVecSet.Value)
 
 		defer func() {
 			if r := recover(); r != nil {

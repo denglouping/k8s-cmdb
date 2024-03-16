@@ -16,15 +16,17 @@ import (
 )
 
 var (
-	deviceStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	deviceStatusLabels  = []string{"id", "name", "node", "revision"}
+	hardwareErrorLabels = []string{"type", "node"}
+	deviceStatus        = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "device_status",
 		Help: "device_status",
-	}, []string{"id", "name", "node", "revision"})
+	}, deviceStatusLabels)
 
 	hardwareError = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "hardware_error_count",
 		Help: "hardware_error_count",
-	}, []string{"type", "node"})
+	}, hardwareErrorLabels)
 )
 
 func init() {
@@ -37,10 +39,24 @@ type Plugin struct {
 	opt       *Options
 	checkLock sync.Mutex
 	result    map[string]interface{}
+	ready     bool
+}
+
+type DeviceStatusResult struct {
+	Address  string `yaml:"address"`
+	Name     string `yaml:"name"`
+	NodeName string `yaml:"nodeName"`
+	Revision string `yaml:"revision"`
+}
+
+type HardwareErrorResult struct {
+	Rule     string `yaml:"rule"`
+	NodeName string `yaml:"nodeName"`
+	Count    int    `yaml:"count"`
 }
 
 // Setup xxx
-func (p *Plugin) Setup(configFilePath string, setValue func(key string, value interface{})) error {
+func (p *Plugin) Setup(configFilePath string, runMode string) error {
 	p.opt = &Options{}
 	err := util.ReadConf(configFilePath, p.opt)
 	if err != nil {
@@ -65,31 +81,33 @@ func (p *Plugin) Setup(configFilePath string, setValue func(key string, value in
 		}
 
 		logFileConfig.logFile.SetSearchKey(logFileConfig.KeyWordList)
-		logFileConfig.logFile.Start()
 
 		p.opt.LogFileConfigList[index] = logFileConfig
 	}
 
-	p.GetLogError()
-
-	go func() {
-		for {
-			if p.checkLock.TryLock() {
-				p.checkLock.Unlock()
-				go p.Check()
-			} else {
-				klog.V(3).Infof("the former hwcheck didn't over, skip in this loop")
+	// run as daemon
+	if runMode == "daemon" {
+		//p.GetLogError()
+		go func() {
+			for {
+				if p.checkLock.TryLock() {
+					p.checkLock.Unlock()
+					go p.Check()
+				} else {
+					klog.V(3).Infof("the former hwcheck didn't over, skip in this loop")
+				}
+				select {
+				case result := <-p.stopChan:
+					klog.V(3).Infof("stop plugin %s by signal %d", p.Name(), result)
+					return
+				case <-time.After(time.Duration(interval) * time.Second):
+					continue
+				}
 			}
-			select {
-			case result := <-p.stopChan:
-				klog.V(3).Infof("stop plugin %s by signal %d", p.Name(), result)
-				return
-			case <-time.After(time.Duration(interval) * time.Second):
-				setValue("hwcheck", p.result)
-				continue
-			}
-		}
-	}()
+		}()
+	} else if runMode == "once" {
+		p.Check()
+	}
 
 	return nil
 }
@@ -107,7 +125,7 @@ func (p *Plugin) Name() string {
 }
 func (p *Plugin) Check() {
 	klog.Infof("start %s", p.Name())
-	nodeName := os.Getenv("NODE_NAME")
+	nodeName := util.GetNodeName()
 
 	deviceList, err := GetDeviceStatus()
 	if err != nil {
@@ -115,15 +133,52 @@ func (p *Plugin) Check() {
 		return
 	}
 
+	deviceStatusResultList := make([]DeviceStatusResult, 0, 0)
+	hardwareErrorResultList := make([]HardwareErrorResult, 0, 0)
 	deviceStatusGaugeVecSetList := make([]*metric.GaugeVecSet, 0, 0)
 	for _, device := range deviceList {
 		deviceStatusGaugeVecSetList = append(deviceStatusGaugeVecSetList, &metric.GaugeVecSet{
 			Labels: []string{device.Address, strings.Replace(device.Vendor.Name, " ", "_", -1), nodeName, device.Revision},
 			Value:  float64(1),
 		})
+		deviceStatusResultList = append(deviceStatusResultList, DeviceStatusResult{device.Address, strings.Replace(device.Vendor.Name, " ", "_", -1), nodeName, device.Revision})
 	}
 
 	metric.SetMetric(deviceStatus, deviceStatusGaugeVecSetList)
+
+	hardwareErrorGVSList := make([]*metric.GaugeVecSet, 0, 0)
+	for _, logFileConfig := range p.opt.LogFileConfigList {
+		result, err := logFileConfig.logFile.CheckNewEntriesOnce()
+		if err != nil {
+			klog.Errorf(err.Error())
+		} else {
+
+			for _, key := range logFileConfig.KeyWordList {
+				count := 0
+				for _, line := range result {
+					if strings.Contains(line, key) {
+						count++
+						hardwareError.WithLabelValues(logFileConfig.Rule, nodeName).Add(1)
+						break
+					}
+				}
+
+				hardwareErrorGVSList = append(hardwareErrorGVSList, &metric.GaugeVecSet{
+					Labels: []string{logFileConfig.Rule, nodeName},
+					Value:  float64(count),
+				})
+				hardwareErrorResultList = append(hardwareErrorResultList, HardwareErrorResult{logFileConfig.Rule, nodeName, count})
+			}
+		}
+	}
+	metric.SetMetric(hardwareError, hardwareErrorGVSList)
+
+	p.result["deviceStatus"] = deviceStatusResultList
+	p.result["hardwareError"] = hardwareErrorResultList
+
+	if !p.ready {
+		p.ready = true
+	}
 }
 
 func GetDeviceStatus() ([]*ghw.PCIDevice, error) {
@@ -161,14 +216,15 @@ func GetDeviceStatus() ([]*ghw.PCIDevice, error) {
 }
 
 func (p *Plugin) GetLogError() {
-	nodeName := os.Getenv("NODE_NAME")
+	nodeName := util.GetNodeName()
 	for _, logFileConfig := range p.opt.LogFileConfigList {
+		logFileConfig.logFile.Start()
 		go func(logFile LogFileConfig, nodeName string) {
 			for {
 				select {
 				case result, ok := <-logFile.logFile.LogChann:
 					if !ok {
-						klog.Info("Channel closed")
+						klog.Error("Channel closed")
 						return
 					}
 
@@ -184,4 +240,16 @@ func (p *Plugin) GetLogError() {
 		}(logFileConfig, nodeName)
 
 	}
+}
+
+func (p *Plugin) Ready() bool {
+	return p.ready
+}
+
+func (p *Plugin) GetResult() interface{} {
+	return p.result
+}
+
+func (p *Plugin) Execute() {
+	p.Check()
 }

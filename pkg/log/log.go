@@ -38,6 +38,7 @@ func openLogFile(filename string) (*LogFile, error) {
 	}
 
 	return &LogFile{filename: filename, file: file, pos: info.Size(), ino: stat.Ino, LogChann: make(chan string)}, nil
+	//return &LogFile{filename: filename, file: file, pos: 0, ino: stat.Ino, LogChann: make(chan string)}, nil
 }
 
 func (f *LogFile) SetSearchKey(searchKeyList []string) {
@@ -57,6 +58,58 @@ func (f *LogFile) Start() {
 			time.Sleep(10 * time.Second)
 		}
 	}()
+}
+
+func (f *LogFile) CheckNewEntriesOnce() ([]string, error) {
+	info, err := f.file.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, fmt.Errorf("failed to get inode number for %s", f.filename)
+	}
+
+	if stat.Ino != f.ino {
+		// 文件已经被轮转，关闭旧的文件并打开新的文件
+		f.file.Close()
+
+		newFile, err := openLogFile(f.filename)
+		if err != nil {
+			return nil, err
+		}
+
+		*f = *newFile
+	}
+
+	result := make([]string, 0, 0)
+	f.pos = 0
+	if info.Size() > f.pos {
+		f.file.Seek(f.pos, io.SeekStart)
+		scanner := bufio.NewScanner(f.file)
+		for scanner.Scan() {
+			line := scanner.Text()
+
+			if f.searchKeyList != nil && len(f.searchKeyList) > 0 {
+				for _, key := range f.searchKeyList {
+					if strings.Contains(line, key) {
+						result = append(result, line)
+						break
+					}
+				}
+			} else {
+				result = append(result, line)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, err
+		}
+
+		f.pos = info.Size()
+	}
+
+	return result, nil
 }
 
 func (f *LogFile) checkNewEntries() error {

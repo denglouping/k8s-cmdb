@@ -21,11 +21,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
-	"os"
 	"os/exec"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -37,13 +36,21 @@ type Plugin struct {
 	checkLock sync.Mutex
 	clientSet *kubernetes.Clientset
 	dnsLock   sync.Mutex
+	result    interface{}
+	ready     bool
+}
+
+type NetCheckResult struct {
+	Node   string `yaml:"node"`
+	Status string `yaml:"status"`
 }
 
 var (
-	netAvailability = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	netAvailabilityLabels = []string{"node", "status"}
+	netAvailability       = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "net_availability",
 		Help: "net_availability, 1 means OK",
-	}, []string{"node", "status"})
+	}, netAvailabilityLabels)
 )
 
 func init() {
@@ -51,7 +58,7 @@ func init() {
 }
 
 // Setup xxx
-func (p *Plugin) Setup(configFilePath string, setValue func(key string, value interface{})) error {
+func (p *Plugin) Setup(configFilePath string, runMode string) error {
 	p.opt = &Options{}
 	err := util.ReadConf(configFilePath, p.opt)
 	if err != nil {
@@ -68,34 +75,42 @@ func (p *Plugin) Setup(configFilePath string, setValue func(key string, value in
 		interval = 60
 	}
 
-	inClusterConfig, err := rest.InClusterConfig()
+	if p.opt.LabelSelector == "" {
+		p.opt.LabelSelector = "name=nodeagent"
+	}
+
+	config, err := util.GetKubeConfig()
 	if err != nil {
 		klog.Fatalf(err.Error())
 	}
-	cs, _ := kubernetes.NewForConfig(inClusterConfig)
+	cs, _ := kubernetes.NewForConfig(config)
 	if err != nil {
 		klog.Fatalf("dnscheck get incluster config failed, only can run as incluster mode")
 	}
 
 	p.clientSet = cs
 
-	go func() {
-		for {
-			if p.checkLock.TryLock() {
-				p.checkLock.Unlock()
-				go p.Check()
-			} else {
-				klog.V(3).Infof("the former dnscheck didn't over, skip in this loop")
+	if runMode == "daemon" {
+		go func() {
+			for {
+				if p.checkLock.TryLock() {
+					p.checkLock.Unlock()
+					go p.Check()
+				} else {
+					klog.V(3).Infof("the former %s didn't over, skip in this loop", p.Name())
+				}
+				select {
+				case result := <-p.stopChan:
+					klog.V(3).Infof("stop plugin %s by signal %d", p.Name(), result)
+					return
+				case <-time.After(time.Duration(interval) * time.Second):
+					continue
+				}
 			}
-			select {
-			case result := <-p.stopChan:
-				klog.V(3).Infof("stop plugin %s by signal %d", p.Name(), result)
-				return
-			case <-time.After(time.Duration(interval) * time.Second):
-				continue
-			}
-		}
-	}()
+		}()
+	} else if runMode == "once" {
+		p.Check()
+	}
 
 	return nil
 }
@@ -123,7 +138,7 @@ func (p *Plugin) Check() {
 		p.checkLock.Unlock()
 	}()
 
-	nodeName := os.Getenv("NODE_NAME")
+	nodeName := util.GetNodeName()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -139,6 +154,11 @@ func (p *Plugin) Check() {
 
 	wg := sync.WaitGroup{}
 	status := "ok"
+
+	if len(podList) == 0 {
+		status = "notargetpod"
+	}
+
 	for _, pod := range podList {
 		if status != "ok" {
 			break
@@ -154,7 +174,7 @@ func (p *Plugin) Check() {
 
 		util.DefaultRoutinePool.Add(1)
 		wg.Add(1)
-		go func() {
+		go func(pod corev1.Pod) {
 			defer func() {
 				wg.Done()
 				util.DefaultRoutinePool.Done()
@@ -166,34 +186,67 @@ func (p *Plugin) Check() {
 			pingStatus := PINGCheck(pod.Status.PodIP)
 			if pingStatus != "ok" {
 				status = pingStatus
+				klog.Error("ping pod %s %s failed: %s", pod.Name, pod.Status.PodIP, status)
 			}
 
-		}()
-
+		}(pod)
 	}
 
 	wg.Wait()
 
 	gaugeVecSet := &metric.GaugeVecSet{
-		Labels: []string{nodeName, "ok"},
+		Labels: []string{nodeName, status},
 		Value:  float64(1),
 	}
+	result := NetCheckResult{
+		Node:   nodeName,
+		Status: status,
+	}
+
 	metric.SetMetric(netAvailability, []*metric.GaugeVecSet{gaugeVecSet})
+	p.result = result
+	//if runMode == "daemon" {
+	//	metric.SetMetric(netAvailability, []*metric.GaugeVecSet{gaugeVecSet})
+	//} else if runMode == "once" {
+	//	util.PrintCheckResult(netAvailabilityLabels, []*metric.GaugeVecSet{gaugeVecSet})
+	//}
+
+	if !p.ready {
+		p.ready = true
+	}
 
 }
 
 func (p *Plugin) getPodList() ([]corev1.Pod, error) {
 	ctx, _ := util.GetCtx(time.Second * 10)
-	podList, err := p.clientSet.CoreV1().Pods(os.Getenv("NAMESPACE")).List(ctx, v1.ListOptions{
+	podList, err := p.clientSet.CoreV1().Pods("kube-system").List(ctx, v1.ListOptions{
 		ResourceVersion: "0",
-		LabelSelector:   "name=nodeagent",
+		LabelSelector:   p.opt.LabelSelector,
+		FieldSelector:   "status.phase=Running",
 	})
 
 	if err != nil {
 		return nil, err
 	}
 
-	return podList.Items, err
+	generationMapList := make(map[int][]corev1.Pod)
+	lastGenerationInt := 0
+	for _, pod := range podList.Items {
+		if generation, ok := pod.Labels["pod-template-generation"]; ok {
+			generationInt, _ := strconv.Atoi(generation)
+			if lastGenerationInt < generationInt {
+				lastGenerationInt = generationInt
+			}
+			if _, ok = generationMapList[generationInt]; !ok {
+				generationMapList[generationInt] = make([]corev1.Pod, 0, 0)
+			}
+			generationMapList[generationInt] = append(generationMapList[generationInt], pod)
+		} else {
+			continue
+		}
+	}
+
+	return generationMapList[lastGenerationInt], err
 }
 
 func PINGCheck(ip string) (status string) {
@@ -201,7 +254,7 @@ func PINGCheck(ip string) (status string) {
 	output, err := pingCmd.CombinedOutput()
 	if err != nil {
 		status = "pingfailed"
-		klog.Error(string(output))
+		klog.Error(string(output), err.Error())
 		return
 	}
 
@@ -251,4 +304,16 @@ func PINGCheckbak(ip string) (status string) {
 
 	status = "ok"
 	return
+}
+
+func (p *Plugin) Ready() bool {
+	return p.ready
+}
+
+func (p *Plugin) GetResult() interface{} {
+	return p.result
+}
+
+func (p *Plugin) Execute() {
+	p.Check()
 }

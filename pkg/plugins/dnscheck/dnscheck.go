@@ -19,10 +19,8 @@ import (
 	"k8s-cmdb/pkg/metric"
 	"k8s-cmdb/pkg/util"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	"net"
-	"os"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -39,13 +37,22 @@ type Plugin struct {
 	checkLock sync.Mutex
 	clientSet *kubernetes.Clientset
 	dnsLock   sync.Mutex
+	result    interface{}
+	ready     bool
+}
+
+type DnsCheckResult struct {
+	Type   string `yaml:"type"`
+	Node   string `yaml:"node"`
+	Status string `yaml:"status"`
 }
 
 var (
-	dnsAvailability = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	dnsAvailabilityLabels = []string{"type", "node", "status"}
+	dnsAvailability       = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "dns_availability",
 		Help: "dns_availability, 1 means OK",
-	}, []string{"type", "node", "status"})
+	}, dnsAvailabilityLabels)
 
 	dnsLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "dns_latency",
@@ -60,7 +67,7 @@ func init() {
 }
 
 // Setup xxx
-func (p *Plugin) Setup(configFilePath string, setValue func(key string, value interface{})) error {
+func (p *Plugin) Setup(configFilePath string, runMode string) error {
 	p.opt = &Options{}
 	err := util.ReadConf(configFilePath, p.opt)
 	if err != nil {
@@ -71,40 +78,47 @@ func (p *Plugin) Setup(configFilePath string, setValue func(key string, value in
 		return err
 	}
 
+	p.result = make(map[string]interface{})
+
 	p.stopChan = make(chan int)
 	interval := p.opt.Interval
 	if interval == 0 {
 		interval = 60
 	}
 
-	inClusterConfig, err := rest.InClusterConfig()
+	config, err := util.GetKubeConfig()
 	if err != nil {
 		klog.Fatalf(err.Error())
 	}
-	cs, _ := kubernetes.NewForConfig(inClusterConfig)
+	cs, _ := kubernetes.NewForConfig(config)
 	if err != nil {
 		klog.Fatalf("dnscheck get incluster config failed, only can run as incluster mode")
 	}
 
 	p.clientSet = cs
 
-	go func() {
-		for {
-			if p.checkLock.TryLock() {
-				p.checkLock.Unlock()
-				go p.Check()
-			} else {
-				klog.V(3).Infof("the former dnscheck didn't over, skip in this loop")
+	// run as daemon
+	if runMode == "daemon" {
+		go func() {
+			for {
+				if p.checkLock.TryLock() {
+					p.checkLock.Unlock()
+					go p.Check()
+				} else {
+					klog.V(3).Infof("the former dnscheck didn't over, skip in this loop")
+				}
+				select {
+				case result := <-p.stopChan:
+					klog.V(3).Infof("stop plugin %s by signal %d", p.Name(), result)
+					return
+				case <-time.After(time.Duration(interval) * time.Second):
+					continue
+				}
 			}
-			select {
-			case result := <-p.stopChan:
-				klog.V(3).Infof("stop plugin %s by signal %d", p.Name(), result)
-				return
-			case <-time.After(time.Duration(interval) * time.Second):
-				continue
-			}
-		}
-	}()
+		}()
+	} else if runMode == "once" {
+		p.Check()
+	}
 
 	return nil
 }
@@ -125,6 +139,7 @@ func (p *Plugin) Name() string {
 
 // Check xxx
 func (p *Plugin) Check() {
+	result := make([]interface{}, 0, 0)
 	p.checkLock.Lock()
 	klog.Infof("start %s", p.Name())
 	defer func() {
@@ -132,7 +147,7 @@ func (p *Plugin) Check() {
 		p.checkLock.Unlock()
 	}()
 
-	nodeName := os.Getenv("NODE_NAME")
+	nodeName := util.GetNodeName()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -143,10 +158,16 @@ func (p *Plugin) Check() {
 	dnsStatusGaugeVecSetList := make([]*metric.GaugeVecSet, 0, 0)
 
 	ctx, _ := util.GetCtx(time.Second * 10)
+
 	status := p.checkDNS(ctx, p.opt.CheckDomain, "")
 	dnsStatusGaugeVecSetList = append(dnsStatusGaugeVecSetList, &metric.GaugeVecSet{
 		Labels: []string{"pod", nodeName, status},
 		Value:  float64(1),
+	})
+	result = append(result, DnsCheckResult{
+		Type:   "pod",
+		Node:   nodeName,
+		Status: status,
 	})
 
 	ctx, _ = util.GetCtx(time.Second * 10)
@@ -155,8 +176,18 @@ func (p *Plugin) Check() {
 		Labels: []string{"host", nodeName, status},
 		Value:  float64(1),
 	})
+	result = append(result, DnsCheckResult{
+		Type:   "host",
+		Node:   nodeName,
+		Status: status,
+	})
 
+	p.result = result
 	metric.SetMetric(dnsAvailability, dnsStatusGaugeVecSetList)
+
+	if !p.ready {
+		p.ready = true
+	}
 }
 
 func (p *Plugin) checkDNS(ctx context.Context, domainList []string, path string) string {
@@ -245,4 +276,16 @@ func dnsLookup(r *net.Resolver, host string) (time.Duration, error) {
 	}
 
 	return time.Since(start), nil
+}
+
+func (p *Plugin) Ready() bool {
+	return p.ready
+}
+
+func (p *Plugin) GetResult() interface{} {
+	return p.result
+}
+
+func (p *Plugin) Execute() {
+	p.Check()
 }

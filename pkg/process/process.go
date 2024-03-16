@@ -10,6 +10,7 @@ import (
 	"k8s-cmdb/pkg/util"
 	"k8s.io/klog/v2"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -20,8 +21,12 @@ import (
 // HOST_PROC
 
 var (
-	mnt      NS = "mnt"
-	hostPath    = util.GetHostPath()
+	mnt          NS = "mnt"
+	hostPath        = util.GetHostPath()
+	systemdPaths    = []string{
+		"/etc/systemd/system/",
+		"/usr/lib/systemd/system/",
+	}
 )
 
 func GetProcessNS(pid int32, ns NS) (syscall.Stat_t, error) {
@@ -34,32 +39,38 @@ func GetProcessNS(pid int32, ns NS) (syscall.Stat_t, error) {
 
 func GetProcessServiceConfigfiles(starter string) (map[string]string, error) {
 	serviceFiles := make(map[string]string)
-	var err error
-	serviceFiles[starter], err = GetConfigfile(fmt.Sprintf("%s/usr/lib/systemd/system/", hostPath) + starter)
-	if err != nil {
-		return nil, err
-	}
-
-	fileInfo, err := os.Stat(fmt.Sprintf("%s/usr/lib/systemd/system/%s.d", hostPath, starter))
-	if err == nil {
-		if fileInfo.IsDir() {
-			files, err := os.ReadDir(fmt.Sprintf("%s/usr/lib/systemd/system/%s.d", hostPath, starter))
-			if err != nil {
-				return nil, err
+	for _, systemdPath := range systemdPaths {
+		var err error
+		serviceFiles[starter], err = GetConfigfile(path.Join(hostPath, systemdPath, starter))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
 			}
+			return nil, err
+		}
 
-			for _, serviceFile := range files {
-				if !serviceFile.IsDir() {
-					serviceFiles[serviceFile.Name()], err = GetConfigfile(fmt.Sprintf("%s/usr/lib/systemd/system/%s.d/%s", hostPath, starter, serviceFile.Name()))
-					if err != nil {
-						return nil, err
+		fileInfo, err := os.Stat(path.Join(hostPath, systemdPath, fmt.Sprintf("%s.d", starter)))
+		if err == nil {
+			if fileInfo.IsDir() {
+				files, err := os.ReadDir(path.Join(hostPath, systemdPath, fmt.Sprintf("%s.d", starter)))
+				if err != nil {
+					return nil, err
+				}
+
+				for _, serviceFile := range files {
+					if !serviceFile.IsDir() {
+						serviceFiles[serviceFile.Name()], err = GetConfigfile(path.Join(hostPath, systemdPath, fmt.Sprintf("%s.d", starter), serviceFile.Name()))
+						if err != nil {
+							return nil, err
+						}
 					}
 				}
 			}
 		}
+		break
 	}
 
-	return serviceFiles, err
+	return serviceFiles, nil
 }
 
 // other, systemd, container, crontab, cmdline
@@ -177,6 +188,10 @@ func GetConfigfileList(params []string, pid int32) (map[string]string, error) {
 		klog.Errorf("Get process %d ConfigFiles failed: %s", pid, err.Error())
 	}
 	for _, param := range params {
+		if strings.Contains(param, "log") {
+			continue
+		}
+
 		re := regexp.MustCompile(`(?:^|=)(/[a-zA-Z0-9\._-]+)+`)
 		//re := regexp.MustCompile(`(/[^/]+)+`)
 		paths := re.FindAllString(param, -1)
@@ -200,16 +215,16 @@ func GetConfigfileList(params []string, pid int32) (map[string]string, error) {
 
 					remainingPath := strings.Replace(configFilepath, mountInfo.Mountpoint, "", -1)
 					if remainingPath != "" {
-						configFilepath = fmt.Sprintf("%s/%s/%s", sourcePath, mountInfo.Root, remainingPath)
+						configFilepath = path.Join(sourcePath, mountInfo.Root, remainingPath)
 					} else {
-						configFilepath = fmt.Sprintf("%s/%s", sourcePath, mountInfo.Root)
+						configFilepath = path.Join(sourcePath, mountInfo.Root)
 					}
 
 					break
 				}
 			}
 
-			processConfigFilepath := fmt.Sprintf("%s/%s", hostPath, configFilepath)
+			processConfigFilepath := path.Join(hostPath, configFilepath)
 			fileInfo, err := os.Stat(processConfigFilepath)
 			if err != nil {
 				klog.Infof("%d Get GetConfigfile %s content failed: %s", pid, configFilepath, err.Error())
@@ -246,6 +261,60 @@ func GetConfigfileList(params []string, pid int32) (map[string]string, error) {
 
 }
 
+func GetProcessStatus() ([]ProcessStatus, error) {
+	var processList []*process.Process
+	var err error
+
+	result, ok := util.GetSyncCache("processList")
+	if !ok {
+		processList, err = process.Processes()
+		if err != nil {
+			klog.Errorf("Get processList failed: %s", err.Error())
+			return nil, err
+		}
+		util.DefaultCache.Set("processList", processList, time.Minute)
+	} else {
+		processList = result.([]*process.Process)
+	}
+
+	processStatusList := make([]ProcessStatus, 0, 0)
+
+	for _, p := range processList {
+		processStatus := ProcessStatus{}
+		processStatus.Name, err = p.Name()
+		if err != nil {
+			continue
+		}
+
+		processStatus.CreateTime, err = p.CreateTime()
+		if err != nil {
+			continue
+		}
+
+		cpustat, err := p.Times()
+		if err != nil {
+			continue
+		}
+		processStatus.CpuTime = cpustat.User + cpustat.System
+
+		processStatus.Pid, err = p.Ppid()
+		if err != nil {
+			klog.Errorf("Get process ppid info failed: %s", err.Error())
+			continue
+		}
+
+		processStatus.Status, err = p.Status()
+		if err != nil {
+			klog.Errorf("Get process ppid Status failed: %s", err.Error())
+			continue
+		}
+
+		processStatusList = append(processStatusList, processStatus)
+	}
+
+	return processStatusList, nil
+}
+
 func GetProcessInfo(exe string, id int32) (*ProcessInfo, error) {
 	var processList []*process.Process
 	var err error
@@ -273,10 +342,19 @@ func GetProcessInfo(exe string, id int32) (*ProcessInfo, error) {
 			continue
 		}
 
+		name, err := p.Name()
+		if err != nil {
+			continue
+		}
+
+		if exe != "" && !strings.Contains(exe, name) {
+			continue
+		}
+
 		processInfo.Params, err = p.CmdlineSlice()
 		if err != nil {
 			klog.Errorf("Get process cmdline info failed: %s", err.Error())
-			return nil, err
+			continue
 		}
 
 		if len(processInfo.Params) == 0 {
@@ -289,25 +367,10 @@ func GetProcessInfo(exe string, id int32) (*ProcessInfo, error) {
 			continue
 		}
 
-		cmdline, err := p.Cmdline()
-		if err != nil {
-			klog.Errorf("Get process cmdline info failed: %s", err.Error())
-			return nil, err
-		}
-		if cmdline == "" {
-			continue
-		}
-
-		//processInfo.Env, err = p.Environ()
-		//if err != nil {
-		//	klog.Errorf("Get process env info failed: %s", err.Error())
-		//	//return nil, err
-		//}
-
 		ppid, err := p.Ppid()
 		if err != nil {
 			klog.Errorf("Get process ppid info failed: %s", err.Error())
-			return nil, err
+			continue
 		}
 
 		processInfo.Starter, err = GetStarter(p.Pid, ppid)
@@ -369,4 +432,8 @@ func GetProcessInfo(exe string, id int32) (*ProcessInfo, error) {
 	}
 
 	return nil, fmt.Errorf("%s process not found", exe)
+}
+
+func GetProcess(id int32) (*process.Process, error) {
+	return process.NewProcess(id)
 }

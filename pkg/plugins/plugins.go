@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 type pluginManager struct {
@@ -16,8 +17,11 @@ type pluginManager struct {
 
 type Plugin interface {
 	Name() string
-	Setup(string, func(key string, value interface{})) error
+	Setup(string, string) error
 	Stop() error
+	Ready() bool
+	GetResult() interface{}
+	Execute()
 }
 
 var (
@@ -51,17 +55,39 @@ func (pm *pluginManager) GetPlugin(plugin string) Plugin {
 	}
 }
 
-func (pm *pluginManager) SetupPlugin(pluginStr string, pluginDir string, setValue func(key string, value interface{})) error {
+func (pm *pluginManager) SetupPlugin(pluginStr, pluginDir, runMode string) error {
 	for _, plugin := range strings.Split(pluginStr, ",") {
 		if p := pm.GetPlugin(plugin); p == nil {
 			return fmt.Errorf("Get Plugin %s failed, nil result", plugin)
 		} else {
 			klog.Infof("Start plugin: %s", plugin)
-			err := p.Setup(filepath.Join(pluginDir, plugin+".conf"), setValue)
+			err := p.Setup(filepath.Join(pluginDir, plugin+".conf"), runMode)
 			if err != nil {
 				return fmt.Errorf("Setup plugin %s failed: %s", p.Name(), err.Error())
 			}
 		}
 	}
 	return nil
+}
+
+func (pm *pluginManager) Ready(pluginStr string) bool {
+	for _, plugin := range strings.Split(pluginStr, ",") {
+		p := pm.GetPlugin(plugin)
+		for {
+			if p.Ready() {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+	}
+	return true
+}
+
+func (pm *pluginManager) GetResult(pluginStr string) map[string]interface{} {
+	result := make(map[string]interface{})
+	for _, plugin := range strings.Split(pluginStr, ",") {
+		p := pm.GetPlugin(plugin)
+		result[plugin] = p.GetResult()
+	}
+	return result
 }

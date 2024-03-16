@@ -1,7 +1,10 @@
 package customizationcheck
 
 import (
+	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
 	"k8s-cmdb/pkg/customization"
+	"k8s-cmdb/pkg/metric"
 	"k8s-cmdb/pkg/util"
 	"k8s.io/klog/v2"
 	"sync"
@@ -13,25 +16,27 @@ import (
 // 2. if there are contaienrs that are in D status
 
 var (
-//	containerStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-//		Name: "container_status",
-//		Help: "container_status",
-//	}, []string{"id", "name", "status"})
+	fileCheckResultLabels = []string{"name", "result", "exist", "match", "node"}
+	fileCheckResult       = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "file_check_result",
+		Help: "file_check_result",
+	}, fileCheckResultLabels)
 )
 
 func init() {
-	//metric.Register(containerStatus)
+	metric.Register(fileCheckResult)
 }
 
 type Plugin struct {
 	stopChan  chan int
 	opt       *Options
 	checkLock sync.Mutex
-	result    map[string]interface{}
+	result    interface{}
+	ready     bool
 }
 
 // Setup xxx
-func (p *Plugin) Setup(configFilePath string, setValue func(key string, value interface{})) error {
+func (p *Plugin) Setup(configFilePath string, runMode string) error {
 	p.opt = &Options{}
 	err := util.ReadConf(configFilePath, p.opt)
 	if err != nil {
@@ -49,24 +54,28 @@ func (p *Plugin) Setup(configFilePath string, setValue func(key string, value in
 		interval = 60
 	}
 
-	go func() {
-		for {
-			if p.checkLock.TryLock() {
-				p.checkLock.Unlock()
-				go p.Check()
-			} else {
-				klog.V(3).Infof("the former clustercheck didn't over, skip in this loop")
+	// run as daemon
+	if runMode == "daemon" {
+		go func() {
+			for {
+				if p.checkLock.TryLock() {
+					p.checkLock.Unlock()
+					go p.Check()
+				} else {
+					klog.V(3).Infof("the former clustercheck didn't over, skip in this loop")
+				}
+				select {
+				case result := <-p.stopChan:
+					klog.V(3).Infof("stop plugin %s by signal %d", p.Name(), result)
+					return
+				case <-time.After(time.Duration(interval) * time.Second):
+					continue
+				}
 			}
-			select {
-			case result := <-p.stopChan:
-				klog.V(3).Infof("stop plugin %s by signal %d", p.Name(), result)
-				return
-			case <-time.After(time.Duration(interval) * time.Second):
-				setValue("customizationcheck", p.result)
-				continue
-			}
-		}
-	}()
+		}()
+	} else if runMode == "once" {
+		p.Check()
+	}
 
 	return nil
 }
@@ -83,8 +92,9 @@ func (p *Plugin) Name() string {
 	return "customizationcheck"
 }
 func (p *Plugin) Check() {
-
 	result := make([]interface{}, 0, 0)
+	nodeName := util.GetNodeName()
+	fileCheckGaugeVecSetList := make([]*metric.GaugeVecSet, 0, 0)
 	for _, confirmation := range p.opt.CustomizeconList {
 		for _, fc := range confirmation.FileConfirmations {
 			fileConfirmation := customization.FileConfirmation{
@@ -95,7 +105,28 @@ func (p *Plugin) Check() {
 				klog.Errorf(err.Error())
 			}
 			result = append(result, fileConfirmation)
+			fileCheckGaugeVecSetList = append(fileCheckGaugeVecSetList, &metric.GaugeVecSet{
+				Labels: []string{fileConfirmation.Name, fmt.Sprintf("%t", fileConfirmation.Result), fmt.Sprintf("%t", fileConfirmation.Exist), fmt.Sprintf("%t", fileConfirmation.ContentMatched), nodeName},
+				Value:  float64(1),
+			})
 		}
 	}
-	p.result["confirmation"] = result
+	p.result = result
+	metric.SetMetric(fileCheckResult, fileCheckGaugeVecSetList)
+
+	if !p.ready {
+		p.ready = true
+	}
+}
+
+func (p *Plugin) Ready() bool {
+	return p.ready
+}
+
+func (p *Plugin) GetResult() interface{} {
+	return p.result
+}
+
+func (p *Plugin) Execute() {
+	p.Check()
 }

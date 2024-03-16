@@ -10,20 +10,16 @@
  * limitations under the License.
  */
 
-package processcheck
+package timecheck
 
-// Options bcs log options
-type Options struct {
-	Interval  int                  `json:"interval" yaml:"interval"`
-	Processes []ProcessCheckConfig `json:"processes" yaml:"processes"`
-}
+import (
+	"k8s-cmdb/pkg/plugins"
+	"sync"
+)
 
-type ProcessCheckConfig struct {
-	Name       string `json:"name" yaml:"name"`
-	ConfigFile string `json:"configFile" yaml:"configFile"`
-}
-
-// Validate validate options
-func (o *Options) Validate() error {
-	return nil
+func init() {
+	plugins.Register(&Plugin{
+		checkLock: sync.Mutex{},
+		stopChan:  make(chan int),
+	})
 }

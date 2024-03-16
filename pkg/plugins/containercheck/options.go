@@ -10,7 +10,7 @@
  * limitations under the License.
  */
 
-package dockercheck
+package containercheck
 
 // Options bcs log options
 type Options struct {

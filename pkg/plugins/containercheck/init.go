@@ -1,4 +1,4 @@
-package dockercheck
+package containercheck
 
 import (
 	"k8s-cmdb/pkg/plugins"

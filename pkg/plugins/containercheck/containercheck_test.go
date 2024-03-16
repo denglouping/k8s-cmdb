@@ -1,4 +1,4 @@
-package dockercheck
+package containercheck
 
 import (
 	"fmt"

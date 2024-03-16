@@ -1,20 +1,17 @@
 package node
 
 import (
-	"k8s-cmdb/pkg/customization"
+	"fmt"
+	"gopkg.in/yaml.v2"
 	"k8s-cmdb/pkg/plugins"
 	"k8s.io/klog/v2"
-	"os"
 	"sync"
 	"time"
 )
 
 type NodeAgentConfig struct {
-	Name                  string                                      `yaml:"name"`
-	Processes             []string                                    `yaml:"processes"`
-	Customizeconfirmation []customization.CustomizeconfirmationConfig `yaml:"customizeconfirmation"`
-	PluginDir             string                                      `yaml:"pluginDir"`
-	//Plugins               map[string]interface{}                      `yaml:"plugins"`
+	//Name string `yaml:"name"`
+	//PluginDir string `yaml:"pluginDir"`
 	interval int `yaml:"interval"`
 }
 
@@ -28,9 +25,12 @@ type NodeInfo struct {
 	// netcheck
 	// dnscheck
 
-	uploader Uploader
-	nac      *NodeAgentConfig
-	plugins  string
+	uploader  Uploader
+	nac       *NodeAgentConfig
+	plugins   string
+	runMode   string
+	pluginDir string
+	sync.Mutex
 }
 
 type Uploader interface {
@@ -40,27 +40,40 @@ type Uploader interface {
 func (n *NodeInfo) Start() {
 	var err error
 
-	err = plugins.Pm.SetupPlugin(n.plugins, n.nac.PluginDir, n.SetResult)
+	err = plugins.Pm.SetupPlugin(n.plugins, n.pluginDir, n.runMode)
 	if err != nil {
 		klog.Fatalf(err.Error())
 	}
 
-	go func() {
-		// plugins
-		if n.Result == nil {
-			n.Result = make(map[string]interface{})
+	plugins.Pm.Ready(n.plugins)
+	n.Result = plugins.Pm.GetResult(n.plugins)
+
+	if n.runMode == "once" {
+		content, _ := yaml.Marshal(n.Result)
+		fmt.Println(string(content))
+
+		err = n.uploader.Upload(n)
+		if err != nil {
+			klog.Errorf(err.Error())
 		}
 
-		time.Sleep(time.Minute)
+		time.Sleep(time.Duration(n.nac.interval) * time.Second)
+		n.Lock()
+		n.Result = plugins.Pm.GetResult(n.plugins)
+		n.Unlock()
+		return
+	}
 
+	go func() {
 		for {
-			n.Renew()
 			err = n.uploader.Upload(n)
 			if err != nil {
 				klog.Errorf(err.Error())
 			}
 
 			time.Sleep(time.Duration(n.nac.interval) * time.Second)
+			n.Result = plugins.Pm.GetResult(n.plugins)
+			n.Renew()
 		}
 	}()
 }
@@ -76,21 +89,18 @@ func (n *NodeInfo) Stop() {
 }
 
 func (n *NodeInfo) Renew() {
-	n.Name = n.nac.Name
-	if n.Name == "" {
-		n.Name = os.Getenv("NODE_NAME")
-	}
-
 	if n.nac.interval < 60 {
 		n.nac.interval = 60
 	}
 }
 
-func NewNodeInfo(nac *NodeAgentConfig, uploader Uploader, pluginStr string) NodeInfo {
+func NewNodeInfo(nac *NodeAgentConfig, uploader Uploader, runMode string, pluginStr string, pluginDir string) NodeInfo {
 	n := NodeInfo{
-		uploader: uploader,
-		nac:      nac,
-		plugins:  pluginStr,
+		uploader:  uploader,
+		nac:       nac,
+		plugins:   pluginStr,
+		runMode:   runMode,
+		pluginDir: pluginDir,
 	}
 	return n
 }

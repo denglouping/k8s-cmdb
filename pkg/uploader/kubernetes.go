@@ -23,6 +23,9 @@ type KubernetesUploader struct {
 
 // TODO 优化K8S api操作次数
 func (u *KubernetesUploader) Upload(info *node.NodeInfo) error {
+	if u.historyLimit == 0 {
+		return nil
+	}
 
 	ctx, _ := util.GetCtx(time.Second * 10)
 	cmList, err := u.cs.CoreV1().ConfigMaps("nodeagent").List(ctx, v1.ListOptions{
@@ -121,7 +124,10 @@ func (u *KubernetesUploader) Upload(info *node.NodeInfo) error {
 			},
 		}
 
+		info.Lock()
 		nodeinfoData, _ := yaml.Marshal(info)
+		info.Unlock()
+
 		newCm.Data = map[string]string{
 			"nodeinfo": string(nodeinfoData) + time.Now().String(),
 		}
