@@ -16,7 +16,7 @@ import "sync"
 
 var (
 	DefaultRoutinePool = RoutinePool{
-		c:  make(chan struct{}, 50),
+		c:  make(chan struct{}, 5),
 		wg: new(sync.WaitGroup),
 	}
 )

@@ -19,6 +19,7 @@ type KubernetesUploader struct {
 	cs           *kubernetes.Clientset
 	historyLimit int
 	name         string
+	namespace    string
 }
 
 // TODO 优化K8S api操作次数
@@ -28,7 +29,7 @@ func (u *KubernetesUploader) Upload(info *node.NodeInfo) error {
 	}
 
 	ctx, _ := util.GetCtx(time.Second * 10)
-	cmList, err := u.cs.CoreV1().ConfigMaps("nodeagent").List(ctx, v1.ListOptions{
+	cmList, err := u.cs.CoreV1().ConfigMaps(u.namespace).List(ctx, v1.ListOptions{
 		ResourceVersion: "0", LabelSelector: "nodeagent=" + u.name})
 	if err != nil {
 		return err
@@ -168,6 +169,6 @@ func (u *KubernetesUploader) Upload(info *node.NodeInfo) error {
 	return nil
 }
 
-func NewKubernetesUploader(name string, cs *kubernetes.Clientset, historyLimit int) *KubernetesUploader {
-	return &KubernetesUploader{name: name, cs: cs, historyLimit: historyLimit}
+func NewKubernetesUploader(name string, cs *kubernetes.Clientset, historyLimit int, namespace string) *KubernetesUploader {
+	return &KubernetesUploader{name: name, cs: cs, historyLimit: historyLimit, namespace: namespace}
 }

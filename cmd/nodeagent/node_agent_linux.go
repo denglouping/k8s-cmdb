@@ -187,7 +187,7 @@ processes:
 
 		cs, _ := kubernetes.NewForConfig(config)
 
-		ul := uploader.NewKubernetesUploader(util.GetNodeName(), cs, nao.CopyNum)
+		ul := uploader.NewKubernetesUploader(util.GetNodeName(), cs, nao.CopyNum, nao.CMNamespace)
 		nodeInfo = node.NewNodeInfo(naConfig, ul, nao.RunMode, nao.Plugins, nao.PluginDir)
 		nodeInfo.Start()
 	}
@@ -198,37 +198,5 @@ processes:
 		signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 		<-signalChan
 	}
-
-	//if nao.RunMode == "daemon" {
-	//	mm := metric.NewMetricManger()
-	//	mm.RunPrometheusMetricsServer()
-	//
-	//	if nao.Upstream == "cluster" {
-	//		config, err := util.GetKubeConfig()
-	//		if err != nil {
-	//			klog.Fatalf(err.Error())
-	//		}
-	//
-	//		cs, _ := kubernetes.NewForConfig(config)
-	//
-	//		ul := uploader.NewKubernetesUploader(util.GetNodeName(), cs, nao.CopyNum)
-	//		nodeInfo = node.NewNodeInfo(naConfig, ul, nao.RunMode, nao.Plugins, nao.PluginDir)
-	//		nodeInfo.Start()
-	//	}
-	//
-	//	klog.Info("start work...")
-	//
-	//	// listening OS shutdown singal
-	//	signalChan := make(chan os.Signal, 1)
-	//	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
-	//	<-signalChan
-	//
-	//} else if nao.RunMode == "once" {
-	//	err = plugins.Pm.SetupPlugin(nao.Plugins, nao.PluginDir, nao.RunMode, func(key string, value interface{}) {})
-	//	if err != nil {
-	//		klog.Fatalf(err.Error())
-	//	}
-	//
-	//}
 
 }

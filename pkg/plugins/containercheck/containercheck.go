@@ -205,8 +205,8 @@ func (p *Plugin) Check() {
 		metric.SetMetric(containerStatus, containerStatusGaugeVecSetList)
 		metric.SetMetric(containerPorcessStatus, containerPidStatusGaugeVecSetList)
 
-		p.result["containerStatus"] = containerStatusResultList
-		p.result["containerPidStatus"] = containerProcessStatusResultList
+		p.result["unnormalContainerStatus"] = containerStatusResultList
+		p.result["unnormalContainerPidStatus"] = containerProcessStatusResultList
 	} else if strings.Contains(p.opt.SockPath, "containerd.sock") {
 		ctx := context.Background()
 

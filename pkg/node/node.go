@@ -72,7 +72,9 @@ func (n *NodeInfo) Start() {
 			}
 
 			time.Sleep(time.Duration(n.nac.interval) * time.Second)
+			n.Lock()
 			n.Result = plugins.Pm.GetResult(n.plugins)
+			n.Unlock()
 			n.Renew()
 		}
 	}()
